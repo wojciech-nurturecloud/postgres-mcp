@@ -330,6 +330,44 @@ Postgres MCP Pro Tools:
 | `analyze_query_indexes` | Analyzes a list of specific SQL queries (up to 10) and recommends optimal indexes for them. |
 | `analyze_db_health` | Performs comprehensive health checks including: buffer cache hit rates, connection health, constraint validation, index health (duplicate/unused/invalid), sequence limits, and vacuum health. |
 
+### DAPI Tools
+
+Postgres MCP Pro includes specialized tools for querying **DAPI (Data API)** historical data. DAPI is NurtureCloud's data integration layer that stores business entities as JSON payloads in PostgreSQL's `data_api_v2.historical_data` table.
+
+**What is DAPI?**
+DAPI is a message bus system similar to Kafka, but with JSON payloads stored in SQL. It provides:
+- Multi-tenant organization hierarchy (org_name → business_id → agency_id)
+- 32+ entity types (contacts, listings, agents, offers, appointments, etc.)
+- JSON payload storage with full entity data
+- Cursor-based pagination for efficient data streaming
+- Soft deletes with merge tracking for entity consolidation
+- External system integration via correlation IDs
+
+**DAPI Tools:**
+
+| Tool Name | Description |
+|-----------|-------------|
+| `dapi_query_historical_data` | Query entities with pagination and filtering by organization, business, time range. Main workhorse for fetching DAPI data. |
+| `dapi_fetch_entity_by_id` | Fast lookup of a specific entity by its UUID. Returns full entity record with JSON payload. |
+| `dapi_extract_payload_field` | Navigate nested JSON payloads using dot notation (e.g., 'data.firstName'). Extracts specific fields without fetching entire entity. |
+| `dapi_query_by_correlation_id` | Find entities by external source ID. Tracks entities from external systems (REA, Domain, etc.). |
+| `dapi_list_component_names` | Discover available entity types with counts and last modified dates. Useful for exploring the DAPI schema. |
+| `dapi_query_deleted_entities` | Track entity deletions and merges. Returns deleted entities with merge target information. |
+| `dapi_batch_fetch_by_ids` | Efficiently fetch multiple entities (up to 100) in a single query. Reduces round trips for bulk operations. |
+| `dapi_count_entities` | Get statistics including total, active, deleted, and merged counts for monitoring and pagination planning. |
+
+**Common DAPI Entity Types:**
+- `contact`: Contacts/people in the system
+- `listing`: Property listings (sales lifecycle)
+- `agent`: Staff users/agents
+- `appointment`: Property viewings (appraisals, inspections, auctions)
+- `interaction`: Communications (phone, email, SMS)
+- `offer`: Offers made for listings
+- `interestedbuyer`: Buyers interested in properties
+- `agenttocontactrelationship`: Agent-contact relationships
+- `business`: Top-level organizational units
+- `agency`: Sales entities within organizations
+
 
 ## Related Projects
 

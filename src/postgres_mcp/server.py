@@ -22,6 +22,8 @@ from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
+from .dapi import dapi_tools
+from .monolith import monolith_tools
 from .explain import ExplainPlanTool
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
@@ -307,6 +309,209 @@ async def get_object_details(
         return format_error_response(str(e))
 
 
+@mcp.tool(
+    description="Get table statistics without running expensive COUNT(*) queries. "
+    "Returns instant estimates from PostgreSQL system catalogs including table size, row count estimate, "
+    "index sizes, and last vacuum/analyze times. SAFE for large production tables."
+)
+async def get_table_stats(
+    schema_name: str = Field(description="Schema name (e.g., 'public', 'data_api_v2')"),
+    table_name: str = Field(description="Table name"),
+) -> ResponseType:
+    """
+    Get comprehensive table statistics without scanning the table.
+
+    This tool queries PostgreSQL system catalogs to provide instant statistics:
+    - Estimated row count (from pg_class.reltuples)
+    - Table size in bytes/MB/GB
+    - Index sizes
+    - Toast table size (for large values)
+    - Last vacuum and analyze timestamps
+    - Live/dead tuple counts
+
+    Safe for large tables in production - does NOT run COUNT(*) or table scans.
+    """
+    try:
+        sql_driver = await get_sql_driver()
+
+        query = """
+            SELECT
+                schemaname,
+                tablename,
+                -- Size information (instantly available)
+                pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as total_size,
+                pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) as table_size,
+                pg_size_pretty(pg_indexes_size(schemaname||'.'||tablename)) as indexes_size,
+                pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename) -
+                              pg_relation_size(schemaname||'.'||tablename) -
+                              pg_indexes_size(schemaname||'.'||tablename)) as toast_size,
+                -- Raw sizes in bytes
+                pg_total_relation_size(schemaname||'.'||tablename) as total_bytes,
+                pg_relation_size(schemaname||'.'||tablename) as table_bytes,
+                pg_indexes_size(schemaname||'.'||tablename) as indexes_bytes,
+                -- Row count estimates from statistics
+                n_live_tup as estimated_live_rows,
+                n_dead_tup as estimated_dead_rows,
+                n_live_tup + n_dead_tup as estimated_total_rows,
+                -- Last maintenance
+                last_vacuum,
+                last_autovacuum,
+                last_analyze,
+                last_autoanalyze,
+                -- Table activity
+                seq_scan as sequential_scans,
+                idx_scan as index_scans,
+                n_tup_ins as inserts,
+                n_tup_upd as updates,
+                n_tup_del as deletes
+            FROM pg_stat_user_tables
+            WHERE schemaname = {}
+              AND tablename = {}
+        """
+
+        rows = await SafeSqlDriver.execute_param_query(sql_driver, query, [schema_name, table_name])
+
+        if not rows or len(rows) == 0:
+            return format_error_response(f"Table not found: {schema_name}.{table_name}")
+
+        stats = dict(rows[0].cells)
+
+        # Add reltuples from pg_class for alternative estimate
+        reltuples_query = """
+            SELECT c.reltuples::bigint as reltuples_estimate
+            FROM pg_class c
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = {}
+              AND c.relname = {}
+        """
+
+        reltuples_rows = await SafeSqlDriver.execute_param_query(
+            sql_driver, reltuples_query, [schema_name, table_name]
+        )
+
+        if reltuples_rows and len(reltuples_rows) > 0:
+            stats['reltuples_estimate'] = reltuples_rows[0].cells.get('reltuples_estimate')
+
+        # Add helpful notes
+        result = {
+            "table": f"{schema_name}.{table_name}",
+            "size": {
+                "total": stats.get('total_size'),
+                "table": stats.get('table_size'),
+                "indexes": stats.get('indexes_size'),
+                "toast": stats.get('toast_size'),
+                "total_bytes": stats.get('total_bytes'),
+                "table_bytes": stats.get('table_bytes'),
+                "indexes_bytes": stats.get('indexes_bytes'),
+            },
+            "rows": {
+                "estimated_live": stats.get('estimated_live_rows'),
+                "estimated_dead": stats.get('estimated_dead_rows'),
+                "estimated_total": stats.get('estimated_total_rows'),
+                "reltuples_estimate": stats.get('reltuples_estimate'),
+                "note": "These are estimates from PostgreSQL statistics. "
+                        "Run ANALYZE table_name to update estimates. "
+                        "For exact count, use COUNT(*) but beware of performance on large tables."
+            },
+            "maintenance": {
+                "last_vacuum": str(stats.get('last_vacuum')) if stats.get('last_vacuum') else None,
+                "last_autovacuum": str(stats.get('last_autovacuum')) if stats.get('last_autovacuum') else None,
+                "last_analyze": str(stats.get('last_analyze')) if stats.get('last_analyze') else None,
+                "last_autoanalyze": str(stats.get('last_autoanalyze')) if stats.get('last_autoanalyze') else None,
+            },
+            "activity": {
+                "sequential_scans": stats.get('sequential_scans'),
+                "index_scans": stats.get('index_scans'),
+                "inserts": stats.get('inserts'),
+                "updates": stats.get('updates'),
+                "deletes": stats.get('deletes'),
+            }
+        }
+
+        return format_text_response(result)
+
+    except Exception as e:
+        logger.error(f"Error getting table stats: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(
+    description="Estimate query cost WITHOUT running the query. "
+    "Returns estimated execution time, rows, and cost from EXPLAIN (no actual execution). "
+    "SAFE for expensive queries - use this before running queries on large tables."
+)
+async def estimate_query_cost(
+    sql: str = Field(description="SQL query to estimate (SELECT, UPDATE, DELETE, INSERT)"),
+) -> ResponseType:
+    """
+    Estimate query cost without executing it.
+
+    Uses EXPLAIN (without ANALYZE) to get PostgreSQL's cost estimates:
+    - Estimated startup cost
+    - Estimated total cost
+    - Estimated rows returned
+    - Query plan structure
+
+    Does NOT execute the query, so it's safe for expensive operations.
+    Use this before running queries on large tables to check if they'll be slow.
+    """
+    try:
+        sql_driver = await get_sql_driver()
+
+        # Use EXPLAIN (not ANALYZE) to get estimates without execution
+        explain_query = f"EXPLAIN (FORMAT JSON, VERBOSE) {sql}"
+
+        rows = await sql_driver.execute_query(explain_query)
+
+        if not rows or len(rows) == 0:
+            return format_error_response("No explain plan returned")
+
+        # Parse the JSON explain output
+        plan_json = rows[0].cells.get('QUERY PLAN')
+
+        if isinstance(plan_json, str):
+            import json
+            plan_json = json.loads(plan_json)
+
+        if not plan_json or len(plan_json) == 0:
+            return format_error_response("Invalid explain plan format")
+
+        plan = plan_json[0].get('Plan', {})
+
+        result = {
+            "query": sql,
+            "estimated_cost": {
+                "startup_cost": plan.get('Startup Cost'),
+                "total_cost": plan.get('Total Cost'),
+                "note": "Cost is in arbitrary units. Higher = more expensive. "
+                        "As a rule of thumb: <1000 is fast, >10000 may be slow, >100000 is very expensive."
+            },
+            "estimated_rows": plan.get('Plan Rows'),
+            "estimated_width": plan.get('Plan Width'),
+            "plan_type": plan.get('Node Type'),
+            "full_plan": plan,
+            "warning": "This is an ESTIMATE. Actual execution may differ. "
+                      "For large tables, consider adding LIMIT or WHERE clauses to reduce cost."
+        }
+
+        # Add cost assessment
+        total_cost = plan.get('Total Cost', 0)
+        if total_cost < 1000:
+            result['assessment'] = "FAST - This query should execute quickly"
+        elif total_cost < 10000:
+            result['assessment'] = "MODERATE - This query may take a few seconds"
+        elif total_cost < 100000:
+            result['assessment'] = "SLOW - This query may take 10+ seconds"
+        else:
+            result['assessment'] = "VERY EXPENSIVE - This query may take minutes or hang. Consider optimization."
+
+        return format_text_response(result)
+
+    except Exception as e:
+        logger.error(f"Error estimating query cost: {e}")
+        return format_error_response(str(e))
+
+
 @mcp.tool(description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.")
 async def explain_query(
     sql: str = Field(description="SQL query to explain"),
@@ -509,6 +714,401 @@ async def get_top_queries(
         return format_error_response(str(e))
 
 
+# DAPI Tools - for querying DAPI (Data API) historical data
+@mcp.tool(
+    description="Query DAPI historical data with pagination. Returns entities of a given type (component_name) "
+    "with filters for organization, business, agency, and time range. Supports pagination via offset/limit."
+)
+async def dapi_query_historical_data(
+    component_name: str = Field(description="Entity type (e.g., 'contact', 'listing', 'agent', 'offer')"),
+    org_name: str = Field(description="Organization name"),
+    business_id: str | None = Field(description="Optional business UUID filter", default=None),
+    agency_id: str | None = Field(description="Optional agency UUID filter", default=None),
+    offset: int = Field(description="Pagination offset (row_number to start from)", default=0),
+    limit: int = Field(description="Maximum number of records to return (1-1000)", default=100),
+    since: str | None = Field(description="Optional ISO timestamp - only return entities modified after this time", default=None),
+    include_deleted: bool = Field(description="Include soft-deleted entities", default=False),
+) -> ResponseType:
+    """Query DAPI historical data with pagination and filtering."""
+    return await dapi_tools.query_historical_data(
+        component_name=component_name,
+        org_name=org_name,
+        business_id=business_id,
+        agency_id=agency_id,
+        offset=offset,
+        limit=limit,
+        since=since,
+        include_deleted=include_deleted,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(description="Fetch a single DAPI entity by its ID. Fast lookup when you know the entity's UUID.")
+async def dapi_fetch_entity_by_id(
+    component_name: str = Field(description="Entity type (e.g., 'contact', 'listing', 'agent')"),
+    org_name: str = Field(description="Organization name"),
+    entity_id: str = Field(description="Entity UUID"),
+) -> ResponseType:
+    """Fetch a single DAPI entity by ID."""
+    return await dapi_tools.fetch_entity_by_id(
+        component_name=component_name,
+        org_name=org_name,
+        entity_id=entity_id,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="Extract a specific field from a DAPI entity's JSON payload using dot notation. "
+    "Useful for navigating nested JSON without fetching the entire entity. "
+    "Example: field_path='data.firstName' or 'email'"
+)
+async def dapi_extract_payload_field(
+    component_name: str = Field(description="Entity type (e.g., 'contact', 'listing')"),
+    org_name: str = Field(description="Organization name"),
+    entity_id: str = Field(description="Entity UUID"),
+    field_path: str = Field(description="Dot-notation path to field in payload (e.g., 'data.firstName')"),
+) -> ResponseType:
+    """Extract a specific field from an entity's JSON payload."""
+    return await dapi_tools.extract_payload_field(
+        component_name=component_name,
+        org_name=org_name,
+        entity_id=entity_id,
+        field_path=field_path,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="Find DAPI entities by their external correlation ID. "
+    "Tracks entities that originated from external systems (e.g., REA, Domain) by their external source ID."
+)
+async def dapi_query_by_correlation_id(
+    component_name: str = Field(description="Entity type (e.g., 'contact', 'listing')"),
+    org_name: str = Field(description="Organization name"),
+    source: str = Field(description="External source system (e.g., 'REA', 'Domain')"),
+    correlation_id: str = Field(description="External correlation/source ID"),
+) -> ResponseType:
+    """Find entities by external correlation ID."""
+    return await dapi_tools.query_by_correlation_id(
+        component_name=component_name,
+        org_name=org_name,
+        source=source,
+        correlation_id=correlation_id,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="List all available DAPI component types (entity types) for an organization. "
+    "Returns counts and last modified dates for each component type."
+)
+async def dapi_list_component_names(
+    org_name: str = Field(description="Organization name"),
+) -> ResponseType:
+    """List all available DAPI component types."""
+    return await dapi_tools.list_component_names(
+        org_name=org_name,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="Query deleted entities from DAPI. "
+    "Track deletions and merges. When entities are merged, returns the target entity information."
+)
+async def dapi_query_deleted_entities(
+    component_name: str = Field(description="Entity type (e.g., 'contact', 'listing')"),
+    org_name: str = Field(description="Organization name"),
+    business_id: str | None = Field(description="Optional business UUID filter", default=None),
+    since: str | None = Field(description="Optional ISO timestamp - only return entities deleted after this time", default=None),
+    include_merge_targets: bool = Field(description="Include merge_payload for merged entities", default=True),
+    limit: int = Field(description="Maximum number of records to return (1-1000)", default=100),
+) -> ResponseType:
+    """Query deleted DAPI entities."""
+    return await dapi_tools.query_deleted_entities(
+        component_name=component_name,
+        org_name=org_name,
+        business_id=business_id,
+        since=since,
+        include_merge_targets=include_merge_targets,
+        limit=limit,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="Fetch multiple DAPI entities by their IDs in a single query. "
+    "Efficient bulk fetch (max 100 IDs) that reduces round trips."
+)
+async def dapi_batch_fetch_by_ids(
+    component_name: str = Field(description="Entity type (e.g., 'contact', 'listing')"),
+    org_name: str = Field(description="Organization name"),
+    entity_ids: list[str] = Field(description="List of entity UUIDs (max 100)"),
+) -> ResponseType:
+    """Batch fetch multiple entities by IDs."""
+    return await dapi_tools.batch_fetch_by_ids(
+        component_name=component_name,
+        org_name=org_name,
+        entity_ids=entity_ids,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="Get count statistics for DAPI entities. "
+    "Returns total, active, deleted, and merged counts for a component type."
+)
+async def dapi_count_entities(
+    component_name: str = Field(description="Entity type (e.g., 'contact', 'listing')"),
+    org_name: str = Field(description="Organization name"),
+    business_id: str | None = Field(description="Optional business UUID filter", default=None),
+    include_deleted: bool = Field(description="Include deleted entities in count", default=False),
+) -> ResponseType:
+    """Count DAPI entities with statistics."""
+    return await dapi_tools.count_entities(
+        component_name=component_name,
+        org_name=org_name,
+        business_id=business_id,
+        include_deleted=include_deleted,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+# ============================================================================
+# MONOLITH POSTGRESQL TOOLS
+# These tools query operational tables in the monolith PostgreSQL database
+# (separate from DAPI). Use these for user lookups, agent-contact relationships,
+# and entity transfer tracking.
+# ============================================================================
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch a single user by ID from fts_users table. "
+    "Returns complete user record including email, name, business, and timestamps."
+)
+async def monolith_fetch_user_by_id(
+    user_id: str = Field(description="User UUID"),
+) -> ResponseType:
+    """Fetch a user by ID from monolith fts_users table."""
+    return await monolith_tools.fetch_user_by_id(
+        user_id=user_id,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch a user by email from fts_users table. "
+    "Useful for authentication, user identification, and support queries."
+)
+async def monolith_fetch_user_by_email(
+    email: str = Field(description="User email address"),
+) -> ResponseType:
+    """Fetch a user by email from monolith fts_users table."""
+    return await monolith_tools.fetch_user_by_email(
+        email=email,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Search users from fts_users with filters and pagination. "
+    "Supports text search (name/email), business filter, archived status, and internal user filtering."
+)
+async def monolith_fetch_users(
+    business_fk: str | None = Field(description="Optional business UUID filter", default=None),
+    text_search: str | None = Field(description="Optional text search (name or email)", default=None),
+    archived: bool | None = Field(description="Optional filter by archived status", default=None),
+    is_internal: bool | None = Field(description="Optional filter for internal users (staff/agents)", default=None),
+    limit: int = Field(description="Maximum results to return (1-1000)", default=100),
+    offset: int = Field(description="Pagination offset", default=0),
+) -> ResponseType:
+    """Search users from monolith fts_users table."""
+    return await monolith_tools.fetch_users(
+        business_fk=business_fk,
+        text_search=text_search,
+        archived=archived,
+        is_internal=is_internal,
+        limit=limit,
+        offset=offset,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch agent-contact relationships by agent ID. "
+    "Traverses from agent → contacts. Use to find all contacts associated with an agent."
+)
+async def monolith_fetch_acr_by_agent_id(
+    agent_id: str = Field(description="Agent UUID"),
+    limit: int = Field(description="Maximum results to return (1-1000)", default=100),
+    offset: int = Field(description="Pagination offset", default=0),
+) -> ResponseType:
+    """Fetch ACR by agent_id from monolith agent_contact_relationship table."""
+    return await monolith_tools.fetch_acr_by_agent_id(
+        agent_id=agent_id,
+        limit=limit,
+        offset=offset,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch agent-contact relationships by contact ID. "
+    "Traverses from contact → agents. Use to find all agents associated with a contact. "
+    "Bidirectional with monolith_fetch_acr_by_agent_id."
+)
+async def monolith_fetch_acr_by_contact_id(
+    contact_id: str = Field(description="Contact UUID"),
+    limit: int = Field(description="Maximum results to return (1-1000)", default=100),
+    offset: int = Field(description="Pagination offset", default=0),
+) -> ResponseType:
+    """Fetch ACR by contact_id from monolith agent_contact_relationship table."""
+    return await monolith_tools.fetch_acr_by_contact_id(
+        contact_id=contact_id,
+        limit=limit,
+        offset=offset,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch entity transfers from a specific source entity by a specific agent. "
+    "Query: 'What did Agent X transfer from Entity Y?' Tracks ownership changes in the audit trail."
+)
+async def monolith_fetch_atel_by_from_entity_id_and_agent_id(
+    from_entity_id: str = Field(description="Source entity UUID (transferred FROM)"),
+    agent_id: str = Field(description="Agent UUID involved in transfer"),
+    limit: int = Field(description="Maximum results to return (1-1000)", default=100),
+    offset: int = Field(description="Pagination offset", default=0),
+) -> ResponseType:
+    """Fetch ATEL by from_entity_id and agent_id from agent_transfer_entity_ledger."""
+    return await monolith_tools.fetch_atel_by_from_entity_id_and_agent_id(
+        from_entity_id=from_entity_id,
+        agent_id=agent_id,
+        limit=limit,
+        offset=offset,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch all transfers FROM a specific source entity. "
+    "Complete transfer history showing who received the entity and when. Use for audit trail."
+)
+async def monolith_fetch_atel_by_from_entity_id(
+    from_entity_id: str = Field(description="Source entity UUID (transferred FROM)"),
+    limit: int = Field(description="Maximum results to return (1-1000)", default=100),
+    offset: int = Field(description="Pagination offset", default=0),
+) -> ResponseType:
+    """Fetch ATEL by from_entity_id from agent_transfer_entity_ledger."""
+    return await monolith_tools.fetch_atel_by_from_entity_id(
+        from_entity_id=from_entity_id,
+        limit=limit,
+        offset=offset,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch all transfers TO a specific destination entity. "
+    "Shows what entities were transferred into an agent/entity's portfolio. "
+    "Bidirectional with monolith_fetch_atel_by_from_entity_id."
+)
+async def monolith_fetch_atel_by_to_entity_id(
+    to_entity_id: str = Field(description="Destination entity UUID (receiving transfers)"),
+    limit: int = Field(description="Maximum results to return (1-1000)", default=100),
+    offset: int = Field(description="Pagination offset", default=0),
+) -> ResponseType:
+    """Fetch ATEL by to_entity_id from agent_transfer_entity_ledger."""
+    return await monolith_tools.fetch_atel_by_to_entity_id(
+        to_entity_id=to_entity_id,
+        limit=limit,
+        offset=offset,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch a single property by ID from fts_properties table. "
+    "Returns complete property record including address, agents, vendor info, phase, lead scoring, etc."
+)
+async def monolith_fetch_property_by_id(
+    property_id: str = Field(description="Property UUID"),
+) -> ResponseType:
+    """Fetch a property by ID from monolith fts_properties table."""
+    return await monolith_tools.fetch_property_by_id(
+        property_id=property_id,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Search properties from fts_properties with filters and pagination. "
+    "Supports business filter and address search. Results ordered by lead priority."
+)
+async def monolith_fetch_properties(
+    business_fk: str | None = Field(description="Optional business UUID filter", default=None),
+    address: str | None = Field(description="Optional text search for address", default=None),
+    limit: int = Field(description="Maximum results to return (1-1000)", default=100),
+    offset: int = Field(description="Pagination offset", default=0),
+) -> ResponseType:
+    """Search properties from monolith fts_properties table."""
+    return await monolith_tools.fetch_properties(
+        business_fk=business_fk,
+        address=address,
+        limit=limit,
+        offset=offset,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch a single agent by ID from fts_users table (where is_internal = true). "
+    "Agents are staff/internal users distinguished from contacts/customers."
+)
+async def monolith_fetch_agent_by_id(
+    agent_id: str = Field(description="Agent UUID"),
+) -> ResponseType:
+    """Fetch an agent by ID from monolith fts_users table."""
+    return await monolith_tools.fetch_agent_by_id(
+        agent_id=agent_id,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch an agent by email from fts_users table (where is_internal = true). "
+    "Only returns internal staff/agents, not contacts/customers."
+)
+async def monolith_fetch_agent_by_email(
+    email: str = Field(description="Agent email address"),
+) -> ResponseType:
+    """Fetch an agent by email from monolith fts_users table."""
+    return await monolith_tools.fetch_agent_by_email(
+        email=email,
+        sql_driver=await get_sql_driver(),
+    )
+
+
+@mcp.tool(
+    description="[MONOLITH] Fetch agents from fts_users with optional business filter and pagination. "
+    "Only returns internal staff/agents (where is_internal = true). Results ordered by org_name and full_name."
+)
+async def monolith_fetch_agents(
+    business_id: str | None = Field(description="Optional business UUID filter", default=None),
+    limit: int = Field(description="Maximum results to return (1-1000)", default=100),
+    offset: int = Field(description="Pagination offset", default=0),
+) -> ResponseType:
+    """Fetch agents from monolith fts_users table."""
+    return await monolith_tools.fetch_agents(
+        business_id=business_id,
+        limit=limit,
+        offset=offset,
+        sql_driver=await get_sql_driver(),
+    )
+
+
 async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="PostgreSQL MCP Server")
@@ -548,9 +1148,18 @@ async def main():
 
     # Add the query tool with a description appropriate to the access mode
     if current_access_mode == AccessMode.UNRESTRICTED:
-        mcp.add_tool(execute_sql, description="Execute any SQL query")
+        mcp.add_tool(execute_sql, description=(
+            "Execute any SQL query. "
+            "⚠️ WARNING: Avoid COUNT(*) on large tables (use get_table_stats instead). "
+            "Use estimate_query_cost to check query cost before running expensive queries on production databases."
+        ))
     else:
-        mcp.add_tool(execute_sql, description="Execute a read-only SQL query")
+        mcp.add_tool(execute_sql, description=(
+            "Execute a read-only SQL query. "
+            "⚠️ WARNING: Avoid COUNT(*) on large tables (use get_table_stats instead). "
+            "Use estimate_query_cost to check query cost before running expensive queries. "
+            "Has 30-second timeout for safety."
+        ))
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
 
